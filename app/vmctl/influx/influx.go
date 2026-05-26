@@ -2,10 +2,14 @@ package influx
 
 import (
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"os"
+	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	influx "github.com/influxdata/influxdb/client/v2"
@@ -57,6 +61,8 @@ type Series struct {
 }
 
 var valueEscaper = strings.NewReplacer(`\`, `\\`, `'`, `\'`)
+
+const schemaProbeTimeFilter = "time >= now() - 181d AND time < now() - 180d"
 
 func (s Series) fetchQuery(timeFilter string) string {
 	conditions := make([]string, 0, len(s.LabelPairs)+len(s.EmptyTags))
@@ -177,8 +183,8 @@ func (c *Client) Explore() ([]*Series, error) {
 	for _, s := range series {
 		fields, ok := mFields[s.Measurement]
 		if !ok {
-			log.Printf("skip measurement %q since it has no fields", s.Measurement)
-			continue
+			//log.Printf("skip measurement %q since it has no fields", s.Measurement)
+			//continue
 		}
 		emptyTags := getEmptyTags(measurementTags[s.Measurement], s.LabelPairs)
 		for _, field := range fields {
@@ -300,15 +306,25 @@ func (c *Client) FetchDataPoints(s *Series) (*ChunkedResponse, error) {
 }
 
 func (c *Client) fieldsByMeasurement() (map[string][]string, error) {
-	q := influx.Query{
-		Command:         "show field keys",
-		Database:        c.database,
-		RetentionPolicy: c.retention,
-	}
-	log.Printf("fetching fields: %s", stringify(q))
-	qValues, err := c.do(q)
+	data, err := os.ReadFile("show_field_keys.json")
 	if err != nil {
-		return nil, fmt.Errorf("error while executing query %q: %s", q.Command, err)
+		return nil, fmt.Errorf("error while reading show_field_keys.json: %s", err)
+	}
+
+	var res influx.Response
+	if err := json.Unmarshal(data, &res); err != nil {
+		return nil, fmt.Errorf("error while parsing show_field_keys.json: %s", err)
+	}
+	if res.Error() != nil {
+		return nil, fmt.Errorf("response error while reading show_field_keys.json: %s", res.Error())
+	}
+	if len(res.Results) < 1 {
+		return nil, fmt.Errorf("show_field_keys.json contains 0 results")
+	}
+
+	qValues, err := parseResult(res.Results[0])
+	if err != nil {
+		return nil, fmt.Errorf("error while parsing show_field_keys.json result: %s", err)
 	}
 
 	var total int
@@ -317,9 +333,12 @@ func (c *Client) fieldsByMeasurement() (map[string][]string, error) {
 	const fType = "fieldType"
 	result := make(map[string][]string, len(qValues))
 	for _, qv := range qValues {
+		if !measurementAllowed(qv.name) {
+			continue
+		}
 		types := qv.values[fType]
 		fields := qv.values[fKey]
-		values := make([]string, 0)
+		values := make([]string, 0, len(fields))
 		for key, field := range fields {
 			if types[key].(string) == "string" {
 				skipped++
@@ -332,31 +351,111 @@ func (c *Client) fieldsByMeasurement() (map[string][]string, error) {
 	}
 
 	if skipped > 0 {
-		log.Printf("found %d fields; skipped %d non-numeric fields", total, skipped)
+		log.Printf("found %d fields from show_field_keys.json; skipped %d non-numeric fields", total, skipped)
 	} else {
-		log.Printf("found %d fields", total)
+		log.Printf("found %d fields from show_field_keys.json", total)
 	}
 	return result, nil
 }
 
 func (c *Client) getSeries() ([]*Series, error) {
-	com := c.getSeriesCommand()
+	measurements, err := c.getMeasurements()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get measurements for series discovery: %s", err)
+	}
+
+	const key = "key"
+	var result []*Series
+
+	for _, measurement := range measurements {
+		com := fmt.Sprintf("show series from %s", influxQualifiedMeasurement(c.retention, measurement))
+		if c.filterSeries != "" {
+			com = fmt.Sprintf("%s %s", com, c.filterSeries)
+		}
+		com = addWhereCondition(com, schemaProbeTimeFilter)
+
+		q := influx.Query{
+			Command:         com,
+			Database:        c.database,
+			RetentionPolicy: c.retention,
+			Chunked:         true,
+			ChunkSize:       c.chunkSize,
+		}
+
+		log.Printf("fetching series for measurement %q: %s", measurement, stringify(q))
+		cr, err := c.QueryAsChunk(q)
+		if err != nil {
+			return nil, fmt.Errorf("error while executing query %q: %s", q.Command, err)
+		}
+
+		for {
+			resp, err := cr.NextResponse()
+			if err != nil {
+				if err == io.EOF {
+					break
+				}
+				return nil, err
+			}
+			if resp.Error() != nil {
+				return nil, fmt.Errorf("response error for query %q: %s", q.Command, resp.Error())
+			}
+			if len(resp.Results) < 1 {
+				continue
+			}
+
+			qValues, err := parseResult(resp.Results[0])
+			if err != nil {
+				return nil, err
+			}
+			for _, qv := range qValues {
+				for _, v := range qv.values[key] {
+					seriesKey, ok := v.(string)
+					if !ok {
+						return nil, fmt.Errorf("unexpected series key type %T", v)
+					}
+					s := &Series{}
+					if err := s.unmarshal(seriesKey); err != nil {
+						return nil, err
+					}
+					result = append(result, s)
+				}
+			}
+		}
+	}
+
+	log.Printf("found %d series across %d measurement(s)", len(result), len(measurements))
+	return result, nil
+}
+
+func influxQualifiedMeasurement(retention, measurement string) string {
+	if retention == "" {
+		return quoteInfluxIdentifier(measurement)
+	}
+	return fmt.Sprintf("%s.%s", quoteInfluxIdentifier(retention), quoteInfluxIdentifier(measurement))
+}
+
+func quoteInfluxIdentifier(s string) string {
+	return `"` + strings.ReplaceAll(s, `"`, `\"`) + `"`
+}
+
+func (c *Client) getMeasurements() ([]string, error) {
 	q := influx.Query{
-		Command:         com,
+		Command:         "show measurements",
 		Database:        c.database,
 		RetentionPolicy: c.retention,
 		Chunked:         true,
 		ChunkSize:       c.chunkSize,
 	}
 
-	log.Printf("fetching series: %s", stringify(q))
+	log.Printf("fetching measurements: %s", stringify(q))
 	cr, err := c.QueryAsChunk(q)
 	if err != nil {
 		return nil, fmt.Errorf("error while executing query %q: %s", q.Command, err)
 	}
 
-	const key = "key"
-	var result []*Series
+	const measurementName = "name"
+	seen := make(map[string]struct{})
+	var result []string
 	for {
 		resp, err := cr.NextResponse()
 		if err != nil {
@@ -368,22 +467,141 @@ func (c *Client) getSeries() ([]*Series, error) {
 		if resp.Error() != nil {
 			return nil, fmt.Errorf("response error for query %q: %s", q.Command, resp.Error())
 		}
+		if len(resp.Results) < 1 {
+			continue
+		}
 		qValues, err := parseResult(resp.Results[0])
 		if err != nil {
 			return nil, err
 		}
 		for _, qv := range qValues {
-			for _, v := range qv.values[key] {
-				s := &Series{}
-				if err := s.unmarshal(v.(string)); err != nil {
-					return nil, err
+			for _, v := range qv.values[measurementName] {
+				measurement, ok := v.(string)
+				if !ok {
+					return nil, fmt.Errorf("unexpected measurement name type %T", v)
 				}
-				result = append(result, s)
+				if !measurementAllowed(measurement) {
+					continue
+				}
+				if _, ok := seen[measurement]; ok {
+					continue
+				}
+				seen[measurement] = struct{}{}
+				result = append(result, measurement)
 			}
 		}
 	}
-	log.Printf("found %d series", len(result))
+
+	if n := measurementRegexpsCount(); n > 0 {
+		log.Printf("found %d measurements matching %d regex filter(s)", len(result), n)
+	} else {
+		log.Printf("found %d measurements", len(result))
+	}
 	return result, nil
+}
+
+const measurementRegexpsFile = "measurement_regexps.txt"
+const measurementExcludeRegexpsFile = "measurement_exclude_regexps.txt"
+
+var (
+	measurementRegexpsOnce    sync.Once
+	measurementRegexps        []*regexp.Regexp
+	measurementExcludeRegexps []*regexp.Regexp
+	measurementRegexpsErr     error
+)
+
+func loadRegexpsFromFile(path string) ([]*regexp.Regexp, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("error while reading %s: %s", path, err)
+	}
+
+	regexps := make([]*regexp.Regexp, 0)
+	for _, line := range strings.Split(string(data), "\n") {
+		expr := strings.TrimSpace(line)
+		if expr == "" {
+			continue
+		}
+		re, err := regexp.Compile(expr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid measurement regex %q in %s: %s", expr, path, err)
+		}
+		regexps = append(regexps, re)
+	}
+
+	return regexps, nil
+}
+
+func loadMeasurementRegexps() ([]*regexp.Regexp, []*regexp.Regexp, error) {
+	measurementRegexpsOnce.Do(func() {
+		var err error
+
+		measurementRegexps, err = loadRegexpsFromFile(measurementRegexpsFile)
+		if err != nil {
+			measurementRegexpsErr = err
+			return
+		}
+
+		measurementExcludeRegexps, err = loadRegexpsFromFile(measurementExcludeRegexpsFile)
+		if err != nil {
+			measurementRegexpsErr = err
+			return
+		}
+
+		log.Printf("loaded %d include measurement regexps from %s and %d exclude measurement regexps from %s",
+			len(measurementRegexps),
+			measurementRegexpsFile,
+			len(measurementExcludeRegexps),
+			measurementExcludeRegexpsFile,
+		)
+	})
+	return measurementRegexps, measurementExcludeRegexps, measurementRegexpsErr
+}
+
+func measurementRegexpsCount() int {
+	includeRegexps, excludeRegexps, err := loadMeasurementRegexps()
+	if err != nil {
+		return 0
+	}
+	return len(includeRegexps) + len(excludeRegexps)
+}
+
+func measurementAllowed(measurement string) bool {
+	includeRegexps, excludeRegexps, err := loadMeasurementRegexps()
+	if err != nil {
+		log.Printf("measurement regex filter disabled: %s", err)
+		return true
+	}
+
+	included := len(includeRegexps) == 0
+	for _, re := range includeRegexps {
+		if re.MatchString(measurement) {
+			included = true
+			break
+		}
+	}
+	if !included {
+		return false
+	}
+
+	for _, re := range excludeRegexps {
+		if re.MatchString(measurement) {
+			return false
+		}
+	}
+
+	return true
+}
+
+func addWhereCondition(com, condition string) string {
+	joinStatement := " where "
+	if strings.Contains(strings.ToLower(com), joinStatement) {
+		joinStatement = " AND "
+	}
+	return fmt.Sprintf("%s%s%s", com, joinStatement, condition)
 }
 
 func (c *Client) getSeriesCommand() string {
@@ -439,6 +657,9 @@ func (c *Client) getMeasurementTags() (map[string]map[string]struct{}, error) {
 			return nil, err
 		}
 		for _, qv := range qValues {
+			if !measurementAllowed(qv.name) {
+				continue
+			}
 			if result[qv.name] == nil {
 				result[qv.name] = make(map[string]struct{}, len(qv.values[tagKey]))
 			}
