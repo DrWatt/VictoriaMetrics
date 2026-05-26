@@ -1,0 +1,29 @@
+[Unit]
+Description=vmagent for Sensu Influx ingestion and stream aggregation
+After=network-online.target vm-one_week.service vm-one_month.service vm-six_months.service vm-all_data.service
+Wants=network-online.target
+Requires=vm-one_week.service vm-one_month.service vm-six_months.service vm-all_data.service
+
+[Service]
+Type=simple
+User=victoriametrics
+Group=victoriametrics
+ExecStart=/usr/local/bin/vmagent \
+  -httpListenAddr=:8427 \
+  -influxListenAddr=:8089 \
+  -remoteWrite.url=http://127.0.0.1:8428/api/v1/write \
+  -remoteWrite.url=http://127.0.0.1:8429/api/v1/write \
+  -remoteWrite.streamAggr.config=/etc/vmagent/stream-aggr-1wto1m.yml \
+  -remoteWrite.streamAggr.keepInput=false \
+  -remoteWrite.url=http://127.0.0.1:8430/api/v1/write \
+  -remoteWrite.streamAggr.config=/etc/vmagent/stream-aggr-1mto6m.yml \
+  -remoteWrite.streamAggr.keepInput=false \
+  -remoteWrite.url=http://127.0.0.1:8431/api/v1/write \
+  -remoteWrite.streamAggr.config=/etc/vmagent/stream-aggr-6mtoall.yml \
+  -remoteWrite.streamAggr.keepInput=false
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

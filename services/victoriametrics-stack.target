@@ -1,0 +1,8 @@
+[Unit]
+Description=VictoriaMetrics single-host stack
+
+
+
+[Install]
+WantedBy=multi-user.target
+

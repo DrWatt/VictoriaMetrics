@@ -1,0 +1,19 @@
+[Unit]
+Description=VictoriaMetrics one month retention
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=victoriametrics
+Group=victoriametrics
+ExecStart=/opt/victoria-metrics-prod \
+  -storageDataPath=/srv/victoria/one_month \
+  -retentionPeriod=30d \
+  -httpListenAddr=:8429
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

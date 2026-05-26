@@ -1,0 +1,9 @@
+- match: '{__name__=~".*_(value|duration)$"}'
+  interval: 15m
+  outputs:
+    - avg
+  output_relabel_configs:
+    - source_labels: [__name__]
+      regex: '(.+):15m_avg'
+      target_label: __name__
+      replacement: '$1'
